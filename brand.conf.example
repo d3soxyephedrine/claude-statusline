@@ -1,0 +1,21 @@
+# Claude statusline brand config
+# Source'd by statusline.sh — set BRAND and DIR_PATH overrides here.
+#
+# Example: Ko2 platform branding
+# case "$CURRENT_DIR" in
+#     "$HOME/projects/ko2"*)
+#         BRAND=$(printf "\033[1;97;48;5;91m ⚡Ko2 \033[0m")
+#         DIR_PATH="${CURRENT_DIR#$HOME/projects/ko2}"
+#         [ -z "$DIR_PATH" ] && DIR_PATH=""
+#         ;;
+#     "$HOME/projects/gpu-fleet"*) DIR_PATH="gpu${CURRENT_DIR#$HOME/projects/gpu-fleet}" ;;
+# esac
+#
+# Example: your own project branding
+# case "$CURRENT_DIR" in
+#     "$HOME/projects/myapp"*)
+#         BRAND=$(printf "\033[1;97;44m MyApp \033[0m")
+#         DIR_PATH="${CURRENT_DIR#$HOME/projects/myapp}"
+#         [ -z "$DIR_PATH" ] && DIR_PATH=""
+#         ;;
+# esac
