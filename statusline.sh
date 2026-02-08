@@ -1,17 +1,96 @@
 #!/bin/bash
 input=$(cat)
 
-# Parse JSON input
-CURRENT_DIR=$(echo "$input" | jq -r '.workspace.current_dir // "~"')
-CONTEXT_USED=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
-COST=$(echo "$input" | jq -r '.cost.total_cost_usd // empty')
+# --- Detect JSON parser once: jq > python3 > node ---
+_JP=""
+if command -v jq &>/dev/null; then _JP="jq"
+elif command -v python3 &>/dev/null; then _JP="py"
+elif command -v node &>/dev/null; then _JP="node"
+fi
+
+# jget <json> <dotpath> [default] — extract a single value
+jget() {
+    local json="$1" path="$2" def="${3:-}"
+    case "$_JP" in
+        jq)   echo "$json" | jq -r "$(echo "$path" | sed 's/\././g; s/^/./' | sed 's/\.\([^.]*\)/.\1/g') // \"$def\"" 2>/dev/null || echo "$def" ;;
+        py)   echo "$json" | python3 -c "
+import sys,json
+try: d=json.load(sys.stdin)
+except: d={}
+v=d
+for k in '$path'.split('.'):
+ v=v.get(k) if isinstance(v,dict) else None
+ if v is None: break
+print(v if v is not None else '$def')" ;;
+        node) echo "$json" | node -e "
+let d={};try{d=JSON.parse(require('fs').readFileSync(0,'utf8'))}catch{}
+let v=d;for(const k of '$path'.split('.')){v=v?.[k];if(v==null){v=undefined;break}}
+console.log(v??'$def')" ;;
+        *)    echo "$def" ;;
+    esac
+}
+
+# jget_multi <json> <"path1 path2 ..."> — extract multiple values, faster (single process)
+jget_multi() {
+    local json="$1"; shift
+    local pairs=("$@")  # "path=VARNAME" pairs
+    case "$_JP" in
+        jq)
+            local script=""
+            for pair in "${pairs[@]}"; do
+                local path="${pair%%=*}" var="${pair#*=}" def="${pair##*:}"
+                [ "$def" = "$pair" ] && def=""
+                path="${pair%%=*}"; path="${path%%:*}"
+                var="${pair#*=}"; var="${var%%:*}"
+                local jqpath=".$(echo "$path" | sed 's/\./\./g')"
+                script+="${var}=\$(echo \"\$json\" | jq -r '$jqpath // \"$def\"' 2>/dev/null);"
+            done
+            eval "$script" ;;
+        py)
+            local pylines=""
+            for pair in "${pairs[@]}"; do
+                local pdef="${pair##*:}"; [ "$pdef" = "$pair" ] && pdef=""
+                local rest="${pair%:*}"; local path="${rest%%=*}"; local var="${rest#*=}"
+                pylines+="
+v=d
+for k in '$path'.split('.'):
+ v=v.get(k) if isinstance(v,dict) else None
+ if v is None: break
+print(f'$var={v if v is not None else \"$pdef\"}')"
+            done
+            eval "$(echo "$json" | python3 -c "
+import sys,json
+try: d=json.load(sys.stdin)
+except: d={}
+$pylines")" ;;
+        node)
+            local nodelines=""
+            for pair in "${pairs[@]}"; do
+                local pdef="${pair##*:}"; [ "$pdef" = "$pair" ] && pdef=""
+                local rest="${pair%:*}"; local path="${rest%%=*}"; local var="${rest#*=}"
+                nodelines+="v=d;for(const k of '$path'.split('.')){v=v?.[k];if(v==null){v=undefined;break}};console.log('$var='+(v??'$pdef'));"
+            done
+            eval "$(echo "$json" | node -e "
+const fs=require('fs');let d={};try{d=JSON.parse(fs.readFileSync(0,'utf8'))}catch{};let v;
+$nodelines")" ;;
+    esac
+}
+
+# Extract all input fields in one call
+jget_multi "$input" \
+    "workspace.current_dir=CURRENT_DIR:~" \
+    "context_window.used_percentage=CONTEXT_USED:" \
+    "cost.total_cost_usd=COST:"
+
+# Permission mode from settings.json
+PERM_MODE="default"
+if [ -f "$HOME/.claude/settings.json" ]; then
+    PERM_MODE=$(jget "$(cat "$HOME/.claude/settings.json")" "permissions.defaultMode" "default")
+fi
+[ -z "$PERM_MODE" ] && PERM_MODE="default"
 
 # Effort level (env var — not in statusline input)
 EFFORT="${CLAUDE_CODE_EFFORT_LEVEL:-high}"
-
-# Permission mode (from settings.json — not in statusline input)
-PERM_MODE=$(jq -r '.permissions.defaultMode // "default"' "$HOME/.claude/settings.json" 2>/dev/null)
-[ -z "$PERM_MODE" ] && PERM_MODE="default"
 
 # Directory — project substitutions (customize in ~/.claude-statusline.conf)
 DIR_PATH="$CURRENT_DIR"
@@ -103,26 +182,27 @@ fi
 LIVE_LINE=""
 STATS_PART=""
 if [ -f "$STATE_FILE" ]; then
-    STATE=$(cat "$STATE_FILE" 2>/dev/null)
-    if [ -n "$STATE" ] && echo "$STATE" | jq -e '.ts' > /dev/null 2>&1; then
-        ACTIVITY=$(echo "$STATE" | jq -r '.activity // "idle"')
-        SNIPPET=$(echo "$STATE" | jq -r '.snippet // ""')
-        TOOL=$(echo "$STATE" | jq -r '.tool // ""')
-        REQS=$(echo "$STATE" | jq -r '.reqs // 0')
-        IN_TOK=$(echo "$STATE" | jq -r '.inTok // 0')
-        OUT_TOK=$(echo "$STATE" | jq -r '.outTok // 0')
-        EXPIRES=$(echo "$STATE" | jq -r '.tokenExp // 0')
-        UPDATED=$(echo "$STATE" | jq -r '.ts // 0')
+    STATE_JSON=$(cat "$STATE_FILE" 2>/dev/null)
+    if [ -n "$STATE_JSON" ]; then
+        jget_multi "$STATE_JSON" \
+            "activity=ACTIVITY:idle" \
+            "reqs=REQS:0" \
+            "inTok=IN_TOK:0" \
+            "outTok=OUT_TOK:0" \
+            "tokenExp=EXPIRES:0" \
+            "ts=UPDATED:0"
+        SNIPPET=$(jget "$STATE_JSON" "snippet" "")
+        TOOL=$(jget "$STATE_JSON" "tool" "")
 
         NOW_MS=$(($(date +%s) * 1000))
-        AGE_MS=$((NOW_MS - UPDATED))
+        AGE_MS=$((NOW_MS - ${UPDATED:-0}))
 
         fmt_tok() {
             local n=$1
-            if [ "$n" -ge 1000000 ]; then
-                printf "%.1fM" "$(echo "$n / 1000000" | bc -l)"
-            elif [ "$n" -ge 1000 ]; then
-                printf "%.0fK" "$(echo "$n / 1000" | bc -l)"
+            if [ "$n" -ge 1000000 ] 2>/dev/null; then
+                printf "%.1fM" "$(echo "$n / 1000000" | bc -l 2>/dev/null || python3 -c "print($n/1000000)")"
+            elif [ "$n" -ge 1000 ] 2>/dev/null; then
+                printf "%.0fK" "$(echo "$n / 1000" | bc -l 2>/dev/null || python3 -c "print($n/1000)")"
             else
                 printf "%d" "$n"
             fi
@@ -130,7 +210,7 @@ if [ -f "$STATE_FILE" ]; then
 
         # Token expiry
         KEY=""
-        if [ "$EXPIRES" -gt 0 ] 2>/dev/null; then
+        if [ "${EXPIRES:-0}" -gt 0 ] 2>/dev/null; then
             MINS=$((EXPIRES / 60))
             if [ "$EXPIRES" -lt 300 ]; then
                 KEY=$(printf "\033[1;31m%dm\033[0m" "$MINS")
@@ -149,12 +229,12 @@ if [ -f "$STATE_FILE" ]; then
 
         # Colorful labeled stats
         STATS_PART=$(printf "\033[2mreq\033[0m \033[1;33m%s\033[0m \033[2m│\033[0m \033[2min\033[0m \033[1;32m%s\033[0m \033[2m│\033[0m \033[2mout\033[0m \033[1;36m%s\033[0m" \
-            "$REQS" "$(fmt_tok "$IN_TOK")" "$(fmt_tok "$OUT_TOK")")
+            "${REQS:-0}" "$(fmt_tok "${IN_TOK:-0}")" "$(fmt_tok "${OUT_TOK:-0}")")
         [ -n "$KEY" ] && STATS_PART=$(printf "%s \033[2m│\033[0m \033[2m🔑\033[0m %s" "$STATS_PART" "$KEY")
         STATS_PART="${STATS_PART}${COST_PART}"
 
         # Live reasoning line
-        if [ "$AGE_MS" -lt 60000 ] && [ "$ACTIVITY" != "idle" ]; then
+        if [ "${AGE_MS:-999999}" -lt 60000 ] && [ "${ACTIVITY:-idle}" != "idle" ]; then
             SNIP=""
             if [ -n "$SNIPPET" ]; then
                 SNIP=$(echo "$SNIPPET" | cut -c1-140)
@@ -180,9 +260,6 @@ if [ -f "$STATE_FILE" ]; then
 fi
 
 # === Output ===
-# Line 1 (when active): live reasoning / tool activity
-# Line 2: [brand] dir git ctx━━━╌╌╌ % [effort] [perms] │ stats
-
 [ -n "$LIVE_LINE" ] && printf "%s\n" "$LIVE_LINE"
 
 if [ -n "$BRAND" ]; then
